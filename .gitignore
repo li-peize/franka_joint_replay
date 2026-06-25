@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
+# catkin build artifacts live in <ws>/build and <ws>/devel, not here
+build/
+devel/

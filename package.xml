@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>franka_joint_replay</name>
+  <version>0.1.0</version>
+  <description>
+    Joint-impedance controller that follows a streamed/whole JointTrajectory,
+    plus a node that replays a LeRobot episode's 7-joint trajectory (+gripper).
+  </description>
+  <maintainer email="lipeize.pku@gmail.com">Peize Li</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>roscpp</depend>
+  <depend>controller_interface</depend>
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+  <depend>realtime_tools</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>joint_trajectory_controller</depend>
+  <depend>franka_hw</depend>
+  <depend>franka_msgs</depend>
+  <depend>eigen</depend>
+
+  <build_depend>libfranka</build_depend>
+  <exec_depend>libfranka</exec_depend>
+
+  <!-- runtime: bring-up, sim, gripper, and the python replay node -->
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>franka_control</exec_depend>
+  <exec_depend>franka_gazebo</exec_depend>
+  <exec_depend>franka_gripper</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
+
+  <export>
+    <controller_interface plugin="${prefix}/franka_joint_replay_plugins.xml"/>
+  </export>
+</package>

@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<!-- Validate the replay in Gazebo before touching hardware. Our controller
+     config is loaded BEFORE franka_gazebo's panda.launch so its controller
+     spawner can start joint_impedance_replay_controller from it. -->
+<launch>
+  <arg name="arm_id"        default="panda"/>
+  <arg name="dataset"/>
+  <arg name="episode"       default="0"/>
+  <arg name="approach_time" default="5.0"/>
+  <arg name="with_velocity" default="true"/>
+  <arg name="replay_gripper" default="true"/>
+  <arg name="rviz"          default="true"/>
+  <arg name="headless"      default="false"/>
+
+  <!-- Load our controller params first so the spawner below finds them. -->
+  <rosparam command="load"
+            file="$(find franka_joint_replay)/config/joint_impedance_replay.yaml"
+            subst_value="true"/>
+
+  <include file="$(find franka_gazebo)/launch/panda.launch">
+    <arg name="arm_id"             value="$(arg arm_id)"/>
+    <arg name="controller"         value="joint_impedance_replay_controller"/>
+    <arg name="interactive_marker" value="false"/>
+    <arg name="use_gripper"        value="true"/>
+    <arg name="rviz"               value="$(arg rviz)"/>
+    <arg name="headless"           value="$(arg headless)"/>
+  </include>
+
+  <node name="replay_lerobot_episode" pkg="franka_joint_replay"
+        type="replay_lerobot_episode.py" output="screen" required="true">
+    <param name="dataset"        value="$(arg dataset)"/>
+    <param name="episode"        value="$(arg episode)"/>
+    <param name="arm_id"         value="$(arg arm_id)"/>
+    <param name="approach_time"  value="$(arg approach_time)"/>
+    <param name="with_velocity"  value="$(arg with_velocity)"/>
+    <param name="replay_gripper" value="$(arg replay_gripper)"/>
+    <param name="command_topic"  value="/joint_impedance_replay_controller/command"/>
+  </node>
+</launch>

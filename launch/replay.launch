@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<!-- Replay a LeRobot episode's 7-joint trajectory (+gripper) on the REAL robot
+     through the joint-impedance controller. Brings up franka_control, loads the
+     controller, and runs the replay node. Do NOT run a Cartesian/teleop
+     controller at the same time - only one controller may claim the joints. -->
+<launch>
+  <arg name="robot_ip"/>
+  <arg name="arm_id"        default="panda"/>
+  <arg name="load_gripper"  default="true"/>
+
+  <arg name="dataset"                            doc="Path to the LeRobot dataset dir"/>
+  <arg name="episode"       default="0"/>
+  <arg name="approach_time" default="5.0"        doc="Seconds to ramp from current pose to episode start"/>
+  <arg name="with_velocity" default="true"/>
+  <arg name="replay_gripper" default="true"/>
+
+  <include file="$(find franka_control)/launch/franka_control.launch" pass_all_args="true"/>
+
+  <rosparam command="load"
+            file="$(find franka_joint_replay)/config/joint_impedance_replay.yaml"
+            subst_value="true"/>
+
+  <node name="controller_spawner" pkg="controller_manager" type="spawner"
+        respawn="false" output="screen"
+        args="joint_impedance_replay_controller"/>
+
+  <node name="replay_lerobot_episode" pkg="franka_joint_replay"
+        type="replay_lerobot_episode.py" output="screen" required="true">
+    <param name="dataset"        value="$(arg dataset)"/>
+    <param name="episode"        value="$(arg episode)"/>
+    <param name="arm_id"         value="$(arg arm_id)"/>
+    <param name="approach_time"  value="$(arg approach_time)"/>
+    <param name="with_velocity"  value="$(arg with_velocity)"/>
+    <param name="replay_gripper" value="$(arg replay_gripper)"/>
+    <param name="command_topic"  value="/joint_impedance_replay_controller/command"/>
+  </node>
+</launch>

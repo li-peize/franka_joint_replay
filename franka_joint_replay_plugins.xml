@@ -1,0 +1,13 @@
+<library path="lib/libfranka_joint_replay">
+  <class name="franka_joint_replay/JointImpedanceTrajectoryController"
+         type="franka_joint_replay::JointImpedanceTrajectoryController"
+         base_class_type="controller_interface::ControllerBase">
+    <description>
+      Joint-impedance controller (k(q_d-q) + d(dq_d-dq) + coriolis, torque-rate
+      saturated) that follows a trajectory_msgs/JointTrajectory command. Low-rate
+      waypoints are interpolated to the 1 kHz loop with quintic-spline segments
+      (linear / cubic depending on whether velocities are supplied). Used to
+      replay recorded joint trajectories.
+    </description>
+  </class>
+</library>
