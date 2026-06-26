@@ -15,9 +15,11 @@ jump). The gripper is replayed by thresholding the recorded width and issuing
 ``franka_gripper`` Move/Grasp goals at the open/close transitions.
 """
 
+import datetime
 import glob
 import json
 import os
+import sys
 
 import actionlib
 import numpy as np
@@ -90,22 +92,29 @@ def _finite_diff_velocity(times, joints):
 
 
 def _build_trajectory(joint_names, current_q, times, joints, approach_time, start_delay,
-                      with_velocity):
+                      with_velocity, approach_rate):
     traj = JointTrajectory()
     traj.header.stamp = rospy.Time.now() + rospy.Duration.from_sec(start_delay)
     traj.joint_names = list(joint_names)
+    ndof = len(joint_names)
 
     vel = _finite_diff_velocity(times, joints) if with_velocity else None
 
-    # Point 0: current configuration; the controller ramps current -> episode[0]
-    # over [0, approach_time].
-    first = JointTrajectoryPoint()
-    first.positions = current_q.tolist()
-    if with_velocity:
-        first.velocities = [0.0] * len(joint_names)
-    first.time_from_start = rospy.Duration.from_sec(0.0)
-    traj.points.append(first)
+    # Approach ramp: a dense linear ramp from the current pose to the episode
+    # start over approach_time, so EVERY mode eases in (a single far point would
+    # make the zero-order-hold mode step the whole gap at once). Covers
+    # [0, approach_time); the episode then continues from approach_time.
+    n_ramp = max(2, int(approach_time * approach_rate))
+    for j in range(n_ramp):
+        frac = j / float(n_ramp)
+        point = JointTrajectoryPoint()
+        point.positions = ((1.0 - frac) * current_q + frac * joints[0]).tolist()
+        if with_velocity:
+            point.velocities = [0.0] * ndof
+        point.time_from_start = rospy.Duration.from_sec(approach_time * frac)
+        traj.points.append(point)
 
+    # Episode, offset by approach_time.
     for k in range(len(times)):
         point = JointTrajectoryPoint()
         point.positions = joints[k].tolist()
@@ -159,13 +168,112 @@ class GripperClients(object):
         rospy.loginfo("Gripper close (Grasp force=%.1f)", self._close_force)
 
 
+def _list_episodes(dataset, limit):
+    """Return recent episodes (newest first) as dicts with index/task/length/
+    duration/mtime, read from meta/episodes.jsonl + the parquet files.
+    """
+    fps = 20.0
+    try:
+        with open(os.path.join(dataset, "meta", "info.json"), encoding="utf-8") as handle:
+            fps = float(json.load(handle).get("fps", 20.0))
+    except Exception:  # noqa: BLE001 - best-effort metadata
+        pass
+
+    meta = {}
+    episodes_jsonl = os.path.join(dataset, "meta", "episodes.jsonl")
+    if os.path.exists(episodes_jsonl):
+        with open(episodes_jsonl, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                idx = d.get("episode_index")
+                if idx is None:
+                    continue
+                tasks = d.get("tasks") or []
+                meta[int(idx)] = {"task": tasks[0] if tasks else "", "length": d.get("length")}
+
+    episodes = []
+    for parquet in glob.glob(os.path.join(dataset, "data", "*", "episode_*.parquet")):
+        base = os.path.basename(parquet)
+        try:
+            idx = int(base[len("episode_"):-len(".parquet")])
+        except ValueError:
+            continue
+        info = meta.get(idx, {})
+        length = info.get("length")
+        episodes.append({
+            "index": idx,
+            "task": info.get("task", ""),
+            "length": length,
+            "duration": (length / fps) if length else None,
+            "mtime": os.path.getmtime(parquet),
+        })
+    episodes.sort(key=lambda e: e["mtime"], reverse=True)
+    return episodes[:limit]
+
+
+def _choose_episode(episodes, requested):
+    """Print the recent episodes and return the chosen episode_index.
+
+    If ``requested`` >= 0 it is honored (non-interactive). Otherwise, with a
+    TTY the user is prompted (Enter = most recent); without a TTY (e.g. under
+    roslaunch) the most recent is auto-selected.
+    """
+    print("\nRecent replayable sequences in this dataset:")
+    print("  %3s  %7s  %7s  %7s  %-16s  %s"
+          % ("sel", "episode", "frames", "dur(s)", "recorded", "task"))
+    for i, e in enumerate(episodes):
+        ts = datetime.datetime.fromtimestamp(e["mtime"]).strftime("%Y-%m-%d %H:%M")
+        frames = str(e["length"]) if e["length"] is not None else "?"
+        dur = ("%.1f" % e["duration"]) if e["duration"] is not None else "?"
+        print("  %3d) %7d  %7s  %7s  %-16s  %s" % (i, e["index"], frames, dur, ts, e["task"]))
+
+    if requested is not None and requested >= 0:
+        print("Episode %d requested via param; replaying it." % requested)
+        return requested
+
+    most_recent = episodes[0]["index"]
+    if not sys.stdin.isatty():
+        rospy.loginfo("Non-interactive (no TTY): auto-selecting most recent episode %d. "
+                      "Run via `rosrun` in a terminal to choose, or pass _episode:=N.",
+                      most_recent)
+        return most_recent
+
+    while True:
+        try:
+            raw = input("\nSelect [0-%d], Enter = most recent (episode %d): "
+                        % (len(episodes) - 1, most_recent)).strip()
+        except EOFError:
+            return most_recent
+        if raw == "":
+            return most_recent
+        try:
+            sel = int(raw)
+        except ValueError:
+            print("  please enter a number.")
+            continue
+        if 0 <= sel < len(episodes):
+            return episodes[sel]["index"]
+        print("  out of range.")
+
+
 def main():
     rospy.init_node("replay_lerobot_episode")
 
-    dataset = rospy.get_param("~dataset")
-    episode = int(rospy.get_param("~episode", 0))
+    dataset = rospy.get_param("~dataset", "")
+    if not dataset:
+        rospy.logerr("~dataset is not set; nothing to replay.")
+        return
+    requested = int(rospy.get_param("~episode", -1))  # -1 = ask / auto most recent
+    max_list = int(rospy.get_param("~max_list", 20))
     arm_id = rospy.get_param("~arm_id", "panda")
     approach_time = float(rospy.get_param("~approach_time", 5.0))
+    approach_rate = float(rospy.get_param("~approach_rate", 20.0))
     start_delay = float(rospy.get_param("~start_delay", 1.0))
     with_velocity = bool(rospy.get_param("~with_velocity", True))
     command_topic = rospy.get_param(
@@ -177,6 +285,12 @@ def main():
 
     joint_names = ["%s_joint%d" % (arm_id, j) for j in range(1, 8)]
 
+    episodes = _list_episodes(dataset, max_list)
+    if not episodes:
+        rospy.logerr("No episodes found under %s/data; nothing to replay.", dataset)
+        return
+    episode = _choose_episode(episodes, requested)
+
     times, state, names = _read_episode(dataset, episode)
     joints = state[:, _joint_indices(names)]
     rospy.loginfo("Episode %d: %d frames, %.2f s, %d-DoF joints.",
@@ -184,7 +298,7 @@ def main():
 
     current_q = _current_q(joint_names)
     traj = _build_trajectory(joint_names, current_q, times, joints, approach_time, start_delay,
-                             with_velocity)
+                             with_velocity, approach_rate)
 
     pub = rospy.Publisher(command_topic, JointTrajectory, queue_size=1, latch=True)
     # Wait for the controller to subscribe so the (timed) trajectory is not missed.

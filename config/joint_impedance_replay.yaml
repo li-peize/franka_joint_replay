@@ -30,3 +30,21 @@ joint_impedance_replay_controller:
     coriolis_factor: 1.0
     # Max per-tick torque change (N*m) for the rate saturation.
     delta_tau_max: 1.0
+
+    # --- low-rate -> 1 kHz bridging mode (override per launch with interpolation:=) ---
+    #   none    -- zero-order hold: feed the stepped targets directly (baseline;
+    #              stair-stepped, torque buzz, lag).
+    #   lowpass -- first-order low-pass of the stepped target (smooth but lagged
+    #              / rounded; cutoff below).
+    #   spline  -- quintic-spline interpolation between waypoints (smooth, tracks).
+    #   ruckig  -- online jerk-limited trajectory generation (smooth, feasible).
+    interpolation_mode: spline
+
+    # Cutoff for the lowpass mode (Hz). Lower = smoother but laggier.
+    lowpass_cutoff_hz: 10.0
+
+    # Ruckig kinematic limits (per joint). Defaults are the Panda limits;
+    # recorded replay is slow, so these are generous.
+    ruckig_max_velocity:     [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]
+    ruckig_max_acceleration: [15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0]
+    ruckig_max_jerk:         [7500.0, 3750.0, 5000.0, 6250.0, 7500.0, 10000.0, 10000.0]

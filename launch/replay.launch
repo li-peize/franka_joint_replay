@@ -8,30 +8,40 @@
   <arg name="arm_id"        default="panda"/>
   <arg name="load_gripper"  default="true"/>
 
-  <arg name="dataset"                            doc="Path to the LeRobot dataset dir"/>
-  <arg name="episode"       default="0"/>
+  <arg name="dataset"       default=""           doc="Path to the LeRobot dataset dir (needed when run_replay)"/>
+  <arg name="episode"       default="-1"         doc="episode index; -1 = auto most recent (no TTY) / prompt (rosrun)"/>
   <arg name="approach_time" default="5.0"        doc="Seconds to ramp from current pose to episode start"/>
   <arg name="with_velocity" default="true"/>
   <arg name="replay_gripper" default="true"/>
+  <arg name="interpolation"  default="spline"  doc="low-rate->1kHz bridge: none | lowpass | spline | ruckig"/>
+  <arg name="run_replay"     default="true"    doc="false = bring up controller only; run the replay node via rosrun for the interactive menu"/>
 
   <include file="$(find franka_control)/launch/franka_control.launch" pass_all_args="true"/>
 
   <rosparam command="load"
             file="$(find franka_joint_replay)/config/joint_impedance_replay.yaml"
             subst_value="true"/>
+  <!-- Override the bridging mode from the launch arg. -->
+  <param name="joint_impedance_replay_controller/interpolation_mode" value="$(arg interpolation)"/>
 
   <node name="controller_spawner" pkg="controller_manager" type="spawner"
         respawn="false" output="screen"
         args="joint_impedance_replay_controller"/>
 
-  <node name="replay_lerobot_episode" pkg="franka_joint_replay"
-        type="replay_lerobot_episode.py" output="screen" required="true">
-    <param name="dataset"        value="$(arg dataset)"/>
-    <param name="episode"        value="$(arg episode)"/>
-    <param name="arm_id"         value="$(arg arm_id)"/>
-    <param name="approach_time"  value="$(arg approach_time)"/>
-    <param name="with_velocity"  value="$(arg with_velocity)"/>
-    <param name="replay_gripper" value="$(arg replay_gripper)"/>
-    <param name="command_topic"  value="/joint_impedance_replay_controller/command"/>
-  </node>
+  <!-- Not required: when replay finishes and the node exits, the controller
+       must KEEP running so it holds the final pose (Ctrl-C to stop).
+       Skipped when run_replay:=false (then run the replay node interactively
+       via `rosrun franka_joint_replay replay_lerobot_episode.py _dataset:=...`). -->
+  <group if="$(arg run_replay)">
+    <node name="replay_lerobot_episode" pkg="franka_joint_replay"
+          type="replay_lerobot_episode.py" output="screen">
+      <param name="dataset"        value="$(arg dataset)"/>
+      <param name="episode"        value="$(arg episode)"/>
+      <param name="arm_id"         value="$(arg arm_id)"/>
+      <param name="approach_time"  value="$(arg approach_time)"/>
+      <param name="with_velocity"  value="$(arg with_velocity)"/>
+      <param name="replay_gripper" value="$(arg replay_gripper)"/>
+      <param name="command_topic"  value="/joint_impedance_replay_controller/command"/>
+    </node>
+  </group>
 </launch>

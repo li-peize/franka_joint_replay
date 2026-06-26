@@ -17,6 +17,7 @@
 #include <sensor_msgs/JointState.h>
 #include <trajectory_msgs/JointTrajectory.h>
 
+#include <ruckig/ruckig.hpp>
 #include <trajectory_interface/quintic_spline_segment.h>
 
 #include <franka_hw/franka_model_interface.h>
@@ -28,10 +29,11 @@ namespace franka_joint_replay {
 //
 // Torque law (from franka_example_controllers/JointImpedanceExampleController):
 //   tau = coriolis_factor*coriolis + k*(q_d - q) + d*(dq_d - dq_filtered),
-// torque-rate saturated. The desired (q_d, dq_d) are sampled at the 1 kHz loop
-// from quintic-spline segments built between the (low-rate) waypoints, reusing
-// trajectory_interface::QuinticSplineSegment for the interpolation math. With
-// no command yet it holds the joint configuration captured in starting().
+// torque-rate saturated. The desired (q_d, dq_d) are produced at the 1 kHz loop
+// from the low-rate waypoints by one of four selectable bridging modes
+// (~interpolation_mode): none (zero-order hold), lowpass, spline (quintic), or
+// ruckig (online jerk-limited OTG). With no command yet it holds the joint
+// configuration captured in starting().
 class JointImpedanceTrajectoryController
     : public controller_interface::MultiInterfaceController<
           franka_hw::FrankaModelInterface,
@@ -43,18 +45,25 @@ class JointImpedanceTrajectoryController
   void update(const ros::Time& time, const ros::Duration& period) override;
 
  private:
-  using Segment = trajectory_interface::QuinticSplineSegment<double>;
-  using SegmentState = Segment::State;        // PosVelAccState<double>
-  using Trajectory = std::vector<Segment>;    // multi-joint segments (dim 7)
+  enum class Mode { kNone, kLowPass, kSpline, kRuckig };
 
-  // Clamp the per-tick change of the commanded torque (matches the franka
-  // examples), relative to the last desired torque tau_J_d.
+  using Segment = trajectory_interface::QuinticSplineSegment<double>;
+  using SegmentState = Segment::State;  // PosVelAccState<double>
+
+  // A parsed command: raw waypoints (for none/lowpass/ruckig) plus pre-built
+  // spline segments (for spline mode), handed to the RT loop as one unit.
+  struct CommandTrajectory {
+    std::vector<double> times;                      // absolute sec, size N
+    std::vector<std::array<double, 7>> positions;   // size N
+    std::vector<std::array<double, 7>> velocities;  // size N, or empty
+    bool has_velocity{false};
+    std::vector<Segment> segments;                  // size N-1 (spline mode)
+  };
+
   std::array<double, 7> saturateTorqueRate(const std::array<double, 7>& tau_d_calculated,
                                            const std::array<double, 7>& tau_J_d);
-
-  // Non-RT: parse a JointTrajectory into spline segments and hand it to the RT
-  // loop via the realtime buffer.
   void commandCallback(const trajectory_msgs::JointTrajectory::ConstPtr& msg);
+  void seedFromCurrent(const std::array<double, 7>& q);  // re-anchor mode state on (re)load
 
   std::unique_ptr<franka_hw::FrankaModelHandle> model_handle_;
   std::unique_ptr<franka_hw::FrankaStateHandle> state_handle_;
@@ -66,12 +75,27 @@ class JointImpedanceTrajectoryController
   double coriolis_factor_{1.0};
   double delta_tau_max_{1.0};
 
+  // --- bridging mode + per-mode params ---
+  Mode mode_{Mode::kSpline};
+  double lp_alpha_{1.0};                       // low-pass coefficient (per tick)
+  std::array<double, 7> ruckig_max_velocity_{};
+  std::array<double, 7> ruckig_max_acceleration_{};
+  std::array<double, 7> ruckig_max_jerk_{};
+
   std::array<double, 7> dq_filtered_{};
   std::array<double, 7> q_hold_{};
 
-  realtime_tools::RealtimeBuffer<std::shared_ptr<Trajectory>> trajectory_buffer_;
-  const Trajectory* active_trajectory_{nullptr};  // RT-only: identity of loaded traj
-  std::size_t segment_index_{0};                  // RT-only: cursor into segments
+  // --- RT-only state ---
+  std::array<double, 7> q_lp_{};      // low-pass filter state
+  std::array<double, 7> q_d_prev_{};  // previous desired (LP velocity FF)
+  SegmentState scratch_state_;        // reused spline sample target (pre-sized; no RT alloc)
+  ruckig::Ruckig<7> otg_{0.001};      // OTG at the 1 kHz control period
+  ruckig::InputParameter<7> ruckig_input_;
+  ruckig::OutputParameter<7> ruckig_output_;
+
+  realtime_tools::RealtimeBuffer<std::shared_ptr<CommandTrajectory>> trajectory_buffer_;
+  const CommandTrajectory* active_trajectory_{nullptr};  // RT-only: identity of loaded traj
+  std::size_t waypoint_index_{0};                        // RT-only: cursor into waypoints
 
   ros::Subscriber command_sub_;
   std::unique_ptr<realtime_tools::RealtimePublisher<sensor_msgs::JointState>> desired_pub_;

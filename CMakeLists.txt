@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.4)
 project(franka_joint_replay)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(catkin REQUIRED COMPONENTS
@@ -19,6 +19,7 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(Eigen3 REQUIRED)
 find_package(Franka REQUIRED)
+find_package(ruckig REQUIRED)
 
 catkin_package(
   INCLUDE_DIRS include
@@ -51,6 +52,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 target_link_libraries(${PROJECT_NAME}
   ${catkin_LIBRARIES}
   ${Franka_LIBRARIES}
+  ruckig::ruckig
 )
 
 ## Install
