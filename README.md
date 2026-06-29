@@ -21,7 +21,7 @@ Two parts:
    frame count / duration / recorded time) and lets you **choose** one — an
    interactive prompt when run in a terminal, or auto-select-most-recent when
    there's no TTY (e.g. under `roslaunch`), or the exact `~episode` if given.
-   It then reads the chosen episode's LeRobot v2.1 parquet **directly** (pandas
+   It then reads the chosen episode's LeRobot v3.0 parquet **directly** (pandas
    + pyarrow — no `lerobot`/torch, so it runs in Noetic's Python), extracts the
    arm-joint trajectory from `observation.state`, prepends the robot's current
    pose, and publishes the whole episode as one `JointTrajectory` (with
@@ -60,7 +60,10 @@ rospack plugins --attrib=plugin controller_interface | grep franka_joint_replay
 
 ## Run
 
-First export an episode with `bag2lerobot` (e.g. to `/tmp/teleop_ds`).
+First export an episode with `bag2lerobot`. The `dataset` arg is optional — when
+omitted it defaults to **`$LEROBOT_DATA_PATH`**, falling back to
+`~/teleop_lerobot` with a warning if that env var is unset. Pass `dataset:=<dir>`
+to override. (Examples below use an explicit dir.)
 
 **One-shot (auto-selects the most recent episode, or pass `episode:=N`):**
 ```bash

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay a LeRobot episode's 7-joint trajectory (+ gripper) on the Franka.
 
-Reads the LeRobot v2.1 dataset parquet DIRECTLY (pandas + pyarrow; no `lerobot`
+Reads the LeRobot v3.0 dataset parquet DIRECTLY (pandas + pyarrow; no `lerobot`
 dependency, so it runs in ROS Noetic's Python), extracts the recorded arm-joint
 trajectory from ``observation.state``, and publishes ONE
 ``trajectory_msgs/JointTrajectory`` to the joint-impedance controller. Because
@@ -15,7 +15,6 @@ jump). The gripper is replayed by thresholding the recorded width and issuing
 ``franka_gripper`` Move/Grasp goals at the open/close transitions.
 """
 
-import datetime
 import glob
 import json
 import os
@@ -45,28 +44,81 @@ def _load_state_names(dataset):
     return list(info["features"]["observation.state"]["names"])
 
 
-def _episode_parquet(dataset, episode):
-    candidate = os.path.join(
-        dataset, "data", "chunk-%03d" % (episode // 1000), "episode_%06d.parquet" % episode)
-    if os.path.exists(candidate):
-        return candidate
-    matches = glob.glob(os.path.join(dataset, "data", "*", "episode_%06d.parquet" % episode))
-    if not matches:
-        raise FileNotFoundError("No parquet for episode %d under %s/data" % (episode, dataset))
-    return matches[0]
+def _dataset_fps(dataset, default=20.0):
+    try:
+        with open(os.path.join(dataset, "meta", "info.json"), encoding="utf-8") as handle:
+            return float(json.load(handle).get("fps", default))
+    except Exception:  # noqa: BLE001 - best-effort metadata
+        return default
+
+
+def _is_dataset(path):
+    return os.path.isfile(os.path.join(path, "meta", "info.json"))
+
+
+def _find_datasets(root):
+    """``root`` is either a LeRobot dataset or a container of dataset dirs
+    (bag2lerobot writes one dataset per run under $LEROBOT_DATA_PATH)."""
+    if _is_dataset(root):
+        return [root]
+    datasets = []
+    if os.path.isdir(root):
+        for name in sorted(os.listdir(root)):
+            sub = os.path.join(root, name)
+            if _is_dataset(sub):
+                datasets.append(sub)
+    return datasets
+
+
+def _episodes_meta(dataset):
+    """v3.0 per-episode metadata (meta/episodes/**/*.parquet) as a DataFrame,
+    or None if absent."""
+    files = sorted(glob.glob(
+        os.path.join(dataset, "meta", "episodes", "**", "*.parquet"), recursive=True))
+    if not files:
+        return None
+    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+
+def _data_files(dataset):
+    return sorted(glob.glob(os.path.join(dataset, "data", "chunk-*", "file-*.parquet")))
 
 
 def _read_episode(dataset, episode):
-    """Return (timestamps[N], state[N, D], state_names)."""
+    """Return (timestamps[N], state[N, D], state_names) for one episode.
+
+    LeRobot v3.0 packs many episodes into shared data files, each row tagged
+    with an ``episode_index`` column. We locate the file via meta/episodes when
+    possible (else scan all data files), then keep this episode's rows.
+    """
     names = _load_state_names(dataset)
-    frame = pd.read_parquet(_episode_parquet(dataset, episode))
+
+    files = []
+    meta = _episodes_meta(dataset)
+    if meta is not None and "data/chunk_index" in meta.columns:
+        row = meta[meta["episode_index"] == episode]
+        if len(row):
+            chunk = int(row.iloc[0]["data/chunk_index"])
+            file_idx = int(row.iloc[0]["data/file_index"])
+            cand = os.path.join(dataset, "data", "chunk-%03d" % chunk,
+                                "file-%03d.parquet" % file_idx)
+            if os.path.exists(cand):
+                files = [cand]
+    if not files:
+        files = _data_files(dataset)
+    if not files:
+        raise FileNotFoundError("No data parquet under %s/data" % dataset)
+
+    frame = pd.concat([pd.read_parquet(p) for p in files], ignore_index=True)
+    frame = frame[frame["episode_index"] == episode].sort_values("frame_index")
+    if frame.empty:
+        raise ValueError("Episode %d not found in %s" % (episode, dataset))
+
     state = np.stack([np.asarray(row, dtype=np.float64) for row in frame["observation.state"]])
     if "timestamp" in frame:
         times = np.asarray(frame["timestamp"], dtype=np.float64)
-    else:  # fall back to a uniform grid from frame_index + fps
-        with open(os.path.join(dataset, "meta", "info.json"), encoding="utf-8") as handle:
-            fps = float(json.load(handle).get("fps", 20.0))
-        times = np.arange(len(state), dtype=np.float64) / fps
+    else:  # fall back to a uniform grid from frame order + fps
+        times = np.arange(len(state), dtype=np.float64) / _dataset_fps(dataset)
     return times - times[0], state, names
 
 
@@ -168,107 +220,111 @@ class GripperClients(object):
         rospy.loginfo("Gripper close (Grasp force=%.1f)", self._close_force)
 
 
-def _list_episodes(dataset, limit):
-    """Return recent episodes (newest first) as dicts with index/task/length/
-    duration/mtime, read from meta/episodes.jsonl + the parquet files.
+def _list_episodes(root, limit):
+    """Recent replayable episodes across the dataset(s) under ``root``, newest
+    first. ``root`` may be a single LeRobot dataset or a container of dataset
+    dirs. Each entry: {dataset, index, task, length, duration}.
     """
-    fps = 20.0
-    try:
-        with open(os.path.join(dataset, "meta", "info.json"), encoding="utf-8") as handle:
-            fps = float(json.load(handle).get("fps", 20.0))
-    except Exception:  # noqa: BLE001 - best-effort metadata
-        pass
-
-    meta = {}
-    episodes_jsonl = os.path.join(dataset, "meta", "episodes.jsonl")
-    if os.path.exists(episodes_jsonl):
-        with open(episodes_jsonl, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                idx = d.get("episode_index")
-                if idx is None:
-                    continue
-                tasks = d.get("tasks") or []
-                meta[int(idx)] = {"task": tasks[0] if tasks else "", "length": d.get("length")}
-
-    episodes = []
-    for parquet in glob.glob(os.path.join(dataset, "data", "*", "episode_*.parquet")):
-        base = os.path.basename(parquet)
-        try:
-            idx = int(base[len("episode_"):-len(".parquet")])
-        except ValueError:
-            continue
-        info = meta.get(idx, {})
-        length = info.get("length")
-        episodes.append({
-            "index": idx,
-            "task": info.get("task", ""),
-            "length": length,
-            "duration": (length / fps) if length else None,
-            "mtime": os.path.getmtime(parquet),
-        })
-    episodes.sort(key=lambda e: e["mtime"], reverse=True)
-    return episodes[:limit]
+    entries = []
+    for dataset in _find_datasets(root):
+        fps = _dataset_fps(dataset)
+        ds_mtime = os.path.getmtime(dataset)
+        meta = _episodes_meta(dataset)
+        if meta is not None:
+            has_len = "length" in meta.columns
+            for _, row in meta.iterrows():
+                tasks = row["tasks"] if "tasks" in meta.columns else None
+                task = str(tasks[0]) if tasks is not None and len(tasks) else ""
+                length = int(row["length"]) if has_len else None
+                entries.append({
+                    "dataset": dataset, "index": int(row["episode_index"]),
+                    "task": task, "length": length,
+                    "duration": (length / fps) if length else None,
+                    "_sort": (ds_mtime, int(row["episode_index"])),
+                })
+        else:  # fallback: derive episodes from the data parquet's episode_index
+            files = _data_files(dataset)
+            if not files:
+                continue
+            col = pd.concat([pd.read_parquet(p, columns=["episode_index"]) for p in files],
+                            ignore_index=True)["episode_index"]
+            for idx in sorted(col.unique().tolist()):
+                length = int((col == idx).sum())
+                entries.append({
+                    "dataset": dataset, "index": int(idx), "task": "",
+                    "length": length, "duration": length / fps,
+                    "_sort": (ds_mtime, int(idx)),
+                })
+    entries.sort(key=lambda e: e["_sort"], reverse=True)
+    return entries[:limit]
 
 
-def _choose_episode(episodes, requested):
-    """Print the recent episodes and return the chosen episode_index.
+def _choose_episode(entries, requested):
+    """Print the recent episodes and return the chosen entry {dataset, index}.
 
-    If ``requested`` >= 0 it is honored (non-interactive). Otherwise, with a
-    TTY the user is prompted (Enter = most recent); without a TTY (e.g. under
-    roslaunch) the most recent is auto-selected.
+    ``requested`` >= 0 selects that episode_index within the most-recent
+    dataset (non-interactive). Otherwise, with a TTY the user is prompted
+    (Enter = most recent); without a TTY the most recent is auto-selected.
     """
-    print("\nRecent replayable sequences in this dataset:")
-    print("  %3s  %7s  %7s  %7s  %-16s  %s"
-          % ("sel", "episode", "frames", "dur(s)", "recorded", "task"))
-    for i, e in enumerate(episodes):
-        ts = datetime.datetime.fromtimestamp(e["mtime"]).strftime("%Y-%m-%d %H:%M")
+    print("\nRecent replayable sequences:")
+    print("  %3s  %-24s  %3s  %7s  %7s  %s"
+          % ("sel", "dataset", "ep", "frames", "dur(s)", "task"))
+    for i, e in enumerate(entries):
+        ds = os.path.basename(e["dataset"].rstrip("/"))[:24]
         frames = str(e["length"]) if e["length"] is not None else "?"
         dur = ("%.1f" % e["duration"]) if e["duration"] is not None else "?"
-        print("  %3d) %7d  %7s  %7s  %-16s  %s" % (i, e["index"], frames, dur, ts, e["task"]))
+        print("  %3d) %-24s  %3d  %7s  %7s  %s" % (i, ds, e["index"], frames, dur, e["task"]))
 
     if requested is not None and requested >= 0:
-        print("Episode %d requested via param; replaying it." % requested)
-        return requested
+        recent_ds = entries[0]["dataset"]
+        for e in entries:
+            if e["dataset"] == recent_ds and e["index"] == requested:
+                print("Episode %d requested via param; replaying it." % requested)
+                return e
+        rospy.logwarn("Requested episode %d not in the most recent dataset; "
+                      "using the most recent entry.", requested)
+        return entries[0]
 
-    most_recent = episodes[0]["index"]
     if not sys.stdin.isatty():
-        rospy.loginfo("Non-interactive (no TTY): auto-selecting most recent episode %d. "
-                      "Run via `rosrun` in a terminal to choose, or pass _episode:=N.",
-                      most_recent)
-        return most_recent
+        rospy.loginfo("Non-interactive (no TTY): auto-selecting the most recent episode. "
+                      "Run via `rosrun` in a terminal to choose, or pass _episode:=N.")
+        return entries[0]
 
     while True:
         try:
-            raw = input("\nSelect [0-%d], Enter = most recent (episode %d): "
-                        % (len(episodes) - 1, most_recent)).strip()
+            raw = input("\nSelect [0-%d], Enter = most recent: " % (len(entries) - 1)).strip()
         except EOFError:
-            return most_recent
+            return entries[0]
         if raw == "":
-            return most_recent
+            return entries[0]
         try:
             sel = int(raw)
         except ValueError:
             print("  please enter a number.")
             continue
-        if 0 <= sel < len(episodes):
-            return episodes[sel]["index"]
+        if 0 <= sel < len(entries):
+            return entries[sel]
         print("  out of range.")
 
 
 def main():
     rospy.init_node("replay_lerobot_episode")
 
-    dataset = rospy.get_param("~dataset", "")
-    if not dataset:
-        rospy.logerr("~dataset is not set; nothing to replay.")
-        return
+    # Processed episodes live in $LEROBOT_DATA_PATH; an explicit ~dataset
+    # overrides it, and the default ~/teleop_lerobot is used (with a warning)
+    # only when neither is set.
+    # data_root is a LeRobot dataset OR a container of dataset dirs (bag2lerobot
+    # writes one dataset per run under $LEROBOT_DATA_PATH).
+    dataset_param = rospy.get_param("~dataset", "")
+    if dataset_param:
+        data_root = os.path.expanduser(dataset_param)
+    elif os.environ.get("LEROBOT_DATA_PATH"):
+        data_root = os.path.expanduser(os.environ["LEROBOT_DATA_PATH"])
+    else:
+        rospy.logwarn(
+            "LEROBOT_DATA_PATH not set and ~dataset empty; using default "
+            "'~/teleop_lerobot'.")
+        data_root = os.path.expanduser("~/teleop_lerobot")
     requested = int(rospy.get_param("~episode", -1))  # -1 = ask / auto most recent
     max_list = int(rospy.get_param("~max_list", 20))
     arm_id = rospy.get_param("~arm_id", "panda")
@@ -285,16 +341,18 @@ def main():
 
     joint_names = ["%s_joint%d" % (arm_id, j) for j in range(1, 8)]
 
-    episodes = _list_episodes(dataset, max_list)
-    if not episodes:
-        rospy.logerr("No episodes found under %s/data; nothing to replay.", dataset)
+    entries = _list_episodes(data_root, max_list)
+    if not entries:
+        rospy.logerr("No LeRobot episodes found under %s; nothing to replay.", data_root)
         return
-    episode = _choose_episode(episodes, requested)
+    entry = _choose_episode(entries, requested)
+    dataset, episode = entry["dataset"], entry["index"]
 
     times, state, names = _read_episode(dataset, episode)
     joints = state[:, _joint_indices(names)]
-    rospy.loginfo("Episode %d: %d frames, %.2f s, %d-DoF joints.",
-                  episode, len(times), float(times[-1]), joints.shape[1])
+    rospy.loginfo("Replaying %s episode %d: %d frames, %.2f s, %d-DoF joints.",
+                  os.path.basename(dataset.rstrip("/")), episode, len(times),
+                  float(times[-1]), joints.shape[1])
 
     current_q = _current_q(joint_names)
     traj = _build_trajectory(joint_names, current_q, times, joints, approach_time, start_delay,

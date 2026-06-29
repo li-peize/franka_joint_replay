@@ -8,7 +8,7 @@
   <arg name="arm_id"        default="panda"/>
   <arg name="load_gripper"  default="true"/>
 
-  <arg name="dataset"       default=""           doc="Path to the LeRobot dataset dir (needed when run_replay)"/>
+  <arg name="dataset"       default=""           doc="LeRobot dataset dir; empty = $LEROBOT_DATA_PATH, else ~/teleop_lerobot"/>
   <arg name="episode"       default="-1"         doc="episode index; -1 = auto most recent (no TTY) / prompt (rosrun)"/>
   <arg name="approach_time" default="5.0"        doc="Seconds to ramp from current pose to episode start"/>
   <arg name="with_velocity" default="true"/>
