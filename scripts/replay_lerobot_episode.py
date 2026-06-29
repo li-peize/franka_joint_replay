@@ -44,6 +44,12 @@ def _load_state_names(dataset):
     return list(info["features"]["observation.state"]["names"])
 
 
+def _load_action_names(dataset):
+    with open(os.path.join(dataset, "meta", "info.json"), encoding="utf-8") as handle:
+        info = json.load(handle)
+    return list(info["features"]["action"]["names"])
+
+
 def _dataset_fps(dataset, default=20.0):
     try:
         with open(os.path.join(dataset, "meta", "info.json"), encoding="utf-8") as handle:
@@ -85,7 +91,7 @@ def _data_files(dataset):
 
 
 def _read_episode(dataset, episode):
-    """Return (timestamps[N], state[N, D], state_names) for one episode.
+    """Return (times[N], state[N,D], state_names, action[N,A], action_names).
 
     LeRobot v3.0 packs many episodes into shared data files, each row tagged
     with an ``episode_index`` column. We locate the file via meta/episodes when
@@ -115,11 +121,12 @@ def _read_episode(dataset, episode):
         raise ValueError("Episode %d not found in %s" % (episode, dataset))
 
     state = np.stack([np.asarray(row, dtype=np.float64) for row in frame["observation.state"]])
+    actions = np.stack([np.asarray(row, dtype=np.float64) for row in frame["action"]])
     if "timestamp" in frame:
         times = np.asarray(frame["timestamp"], dtype=np.float64)
     else:  # fall back to a uniform grid from frame order + fps
         times = np.arange(len(state), dtype=np.float64) / _dataset_fps(dataset)
-    return times - times[0], state, names
+    return times - times[0], state, names, actions, _load_action_names(dataset)
 
 
 def _joint_indices(names):
@@ -177,12 +184,12 @@ def _build_trajectory(joint_names, current_q, times, joints, approach_time, star
     return traj
 
 
-def _gripper_events(times, width, open_thr, close_thr, max_width):
-    """List of (episode_time, 'open'|'close') at width transitions (hysteresis)."""
+def _gripper_events(times, signal, open_thr, close_thr):
+    """List of (episode_time, 'open'|'close') at command transitions (hysteresis)."""
     events = []
     state = None
     for k in range(len(times)):
-        w = float(width[k])
+        w = float(signal[k])
         if w >= open_thr:
             new = "open"
         elif w <= close_thr:
@@ -335,9 +342,10 @@ def main():
     command_topic = rospy.get_param(
         "~command_topic", "/joint_impedance_replay_controller/command")
     replay_gripper = bool(rospy.get_param("~replay_gripper", True))
-    gripper_max_width = float(rospy.get_param("~gripper_max_width", 0.08))
-    open_thr = float(rospy.get_param("~gripper_open_threshold", 0.6 * gripper_max_width))
-    close_thr = float(rospy.get_param("~gripper_close_threshold", 0.4 * gripper_max_width))
+    # The gripper command (action channel) is normalized to [0, 1] (1 = open,
+    # 0 = closed); thresholds are on that normalized signal.
+    open_thr = float(rospy.get_param("~gripper_open_threshold", 0.6))
+    close_thr = float(rospy.get_param("~gripper_close_threshold", 0.4))
 
     joint_names = ["%s_joint%d" % (arm_id, j) for j in range(1, 8)]
 
@@ -348,7 +356,7 @@ def main():
     entry = _choose_episode(entries, requested)
     dataset, episode = entry["dataset"], entry["index"]
 
-    times, state, names = _read_episode(dataset, episode)
+    times, state, names, actions, action_names = _read_episode(dataset, episode)
     joints = state[:, _joint_indices(names)]
     rospy.loginfo("Replaying %s episode %d: %d frames, %.2f s, %d-DoF joints.",
                   os.path.basename(dataset.rstrip("/")), episode, len(times),
@@ -374,9 +382,9 @@ def main():
 
     # Gripper playback, timed against the same start + approach offset.
     if replay_gripper:
-        gripper_idx = names.index("gripper") if "gripper" in names else None
+        gripper_idx = action_names.index("gripper") if "gripper" in action_names else None
         if gripper_idx is None:
-            rospy.logwarn("No 'gripper' in observation.state; skipping gripper replay.")
+            rospy.logwarn("No 'gripper' in the action features; skipping gripper replay.")
         else:
             grip = GripperClients(
                 open_width=float(rospy.get_param("~open_width", 0.08)),
@@ -386,14 +394,16 @@ def main():
                 close_force=float(rospy.get_param("~close_force", 30.0)),
                 eps_inner=float(rospy.get_param("~close_epsilon_inner", 0.005)),
                 eps_outer=float(rospy.get_param("~close_epsilon_outer", 0.08)))
-            events = _gripper_events(times, state[:, gripper_idx], open_thr, close_thr,
-                                     gripper_max_width)
-            for episode_t, action in events:
+            # Replay the recorded gripper COMMAND (action channel), not the
+            # measured width -- which barely moves when grasping an object and
+            # would never cross the thresholds.
+            events = _gripper_events(times, actions[:, gripper_idx], open_thr, close_thr)
+            for episode_t, cmd in events:
                 exec_time = traj_start + rospy.Duration.from_sec(approach_time + episode_t)
                 _sleep_until(exec_time)
                 if rospy.is_shutdown():
                     return
-                grip.open() if action == "open" else grip.close()
+                grip.open() if cmd == "open" else grip.close()
 
     # Stay alive until the motion finishes (latched trajectory keeps holding).
     end_time = traj_start + rospy.Duration.from_sec(approach_time + float(times[-1]) + 1.0)
